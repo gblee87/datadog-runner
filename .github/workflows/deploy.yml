@@ -1,0 +1,327 @@
+name: Build and Deploy to EKS
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+        - staging
+        - production
+      version:
+        description: 'Image version tag'
+        required: false
+        default: ''
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY_PREFIX: datadog-runner
+  KUBECTL_VERSION: v1.28.0
+  EKS_CLUSTER_NAME: datadog-runner
+
+jobs:
+  build:
+    name: Build and Push Images
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      image-tag: ${{ steps.version.outputs.version }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Generate version
+      id: version
+      run: |
+        if [ "${{ github.event.inputs.version }}" != "" ]; then
+          VERSION="${{ github.event.inputs.version }}"
+        elif [ "${{ github.ref }}" = "refs/heads/main" ]; then
+          VERSION="v$(date +%Y%m%d)-$(echo ${{ github.sha }} | cut -c1-7)"
+        else
+          VERSION="dev-$(echo ${{ github.sha }} | cut -c1-7)"
+        fi
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "Generated version: $VERSION"
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build and push auth-python
+      uses: docker/build-push-action@v5
+      with:
+        context: ./services/auth-python
+        platforms: linux/amd64
+        push: true
+        tags: |
+          ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_PREFIX }}/auth-python:${{ steps.version.outputs.version }}
+          ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_PREFIX }}/auth-python:latest
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Build and push chat-node
+      uses: docker/build-push-action@v5
+      with:
+        context: ./services/chat-node
+        platforms: linux/amd64
+        push: true
+        tags: |
+          ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_PREFIX }}/chat-node:${{ steps.version.outputs.version }}
+          ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_PREFIX }}/chat-node:latest
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Build and push ranking-java
+      uses: docker/build-push-action@v5
+      with:
+        context: ./services/ranking-java
+        platforms: linux/amd64
+        push: true
+        tags: |
+          ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_PREFIX }}/ranking-java:${{ steps.version.outputs.version }}
+          ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_PREFIX }}/ranking-java:latest
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Build and push frontend-react
+      uses: docker/build-push-action@v5
+      with:
+        context: ./frontend-react
+        platforms: linux/amd64
+        push: true
+        tags: |
+          ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_PREFIX }}/frontend-react:${{ steps.version.outputs.version }}
+          ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_PREFIX }}/frontend-react:latest
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Create ECR repositories if they don't exist
+      run: |
+        SERVICES=("auth-python" "chat-node" "ranking-java" "frontend-react")
+        for SERVICE in "${SERVICES[@]}"; do
+          REPO_NAME="${{ env.ECR_REPOSITORY_PREFIX }}/$SERVICE"
+          aws ecr describe-repositories --repository-names $REPO_NAME --region ${{ env.AWS_REGION }} 2>/dev/null || \
+          aws ecr create-repository --repository-name $REPO_NAME --region ${{ env.AWS_REGION }}
+        done
+
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/develop' || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'staging')
+    environment: staging
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Install kubectl
+      run: |
+        curl -LO "https://dl.k8s.io/release/${{ env.KUBECTL_VERSION }}/bin/linux/amd64/kubectl"
+        chmod +x kubectl
+        sudo mv kubectl /usr/local/bin/
+
+    - name: Update kubeconfig
+      run: |
+        aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.EKS_CLUSTER_NAME }}
+
+    - name: Update manifests with new image tags
+      run: |
+        VERSION=${{ needs.build.outputs.version }}
+        AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+        
+        # Create updated manifests directory
+        mkdir -p ./infra/k8s-updated
+        
+        # Update image paths in manifests
+        for file in ./infra/k8s/*.yaml; do
+          filename=$(basename "$file")
+          echo "Updating $filename"
+          
+          sed "s|yourrepo/auth-python:0.1.0|$AWS_ACCOUNT_ID.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_PREFIX }}/auth-python:$VERSION|g" "$file" | \
+          sed "s|yourrepo/chat-node:0.1.0|$AWS_ACCOUNT_ID.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_PREFIX }}/chat-node:$VERSION|g" | \
+          sed "s|yourrepo/ranking-java:0.1.0|$AWS_ACCOUNT_ID.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_PREFIX }}/ranking-java:$VERSION|g" | \
+          sed "s|yourrepo/frontend-react:0.1.0|$AWS_ACCOUNT_ID.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_PREFIX }}/frontend-react:$VERSION|g" > "./infra/k8s-updated/$filename"
+        done
+
+    - name: Create namespace
+      run: |
+        kubectl create namespace staging --dry-run=client -o yaml | kubectl apply -f -
+
+    - name: Deploy infrastructure services
+      run: |
+        echo "Deploying infrastructure services..."
+        kubectl apply -f ./infra/k8s-updated/postgres.yaml -n staging
+        kubectl apply -f ./infra/k8s-updated/redis.yaml -n staging
+        kubectl apply -f ./infra/k8s-updated/rabbitmq.yaml -n staging
+
+    - name: Wait for infrastructure services
+      run: |
+        echo "Waiting for infrastructure services to be ready..."
+        kubectl wait --for=condition=ready pod -l app=postgres --timeout=300s -n staging
+        kubectl wait --for=condition=ready pod -l app=redis --timeout=300s -n staging
+        kubectl wait --for=condition=ready pod -l app=rabbitmq --timeout=300s -n staging
+
+    - name: Deploy application services
+      run: |
+        echo "Deploying application services..."
+        kubectl apply -f ./infra/k8s-updated/auth-python.yaml -n staging
+        kubectl apply -f ./infra/k8s-updated/ranking-java.yaml -n staging
+        kubectl apply -f ./infra/k8s-updated/chat-node.yaml -n staging
+
+    - name: Wait for application services
+      run: |
+        echo "Waiting for application services to be ready..."
+        kubectl wait --for=condition=ready pod -l app=auth-python --timeout=300s -n staging
+        kubectl wait --for=condition=ready pod -l app=ranking-java --timeout=300s -n staging
+        kubectl wait --for=condition=ready pod -l app=chat-node --timeout=300s -n staging
+
+    - name: Deploy frontend
+      run: |
+        echo "Deploying frontend..."
+        kubectl apply -f ./infra/k8s-updated/frontend.yaml -n staging
+        kubectl wait --for=condition=ready pod -l app=frontend --timeout=300s -n staging
+
+    - name: Deploy ingress
+      run: |
+        echo "Deploying ingress..."
+        kubectl apply -f ./infra/k8s-updated/ingress.yaml -n staging
+
+    - name: Check deployment status
+      run: |
+        echo "=== Deployment Status ==="
+        kubectl get pods -n staging
+        echo ""
+        kubectl get services -n staging
+        echo ""
+        kubectl get ingress -n staging
+
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production')
+    environment: production
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Install kubectl
+      run: |
+        curl -LO "https://dl.k8s.io/release/${{ env.KUBECTL_VERSION }}/bin/linux/amd64/kubectl"
+        chmod +x kubectl
+        sudo mv kubectl /usr/local/bin/
+
+    - name: Update kubeconfig
+      run: |
+        aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.EKS_CLUSTER_NAME }}
+
+    - name: Update manifests with new image tags
+      run: |
+        VERSION=${{ needs.build.outputs.version }}
+        AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+        
+        # Create updated manifests directory
+        mkdir -p ./infra/k8s-updated
+        
+        # Update image paths in manifests
+        for file in ./infra/k8s/*.yaml; do
+          filename=$(basename "$file")
+          echo "Updating $filename"
+          
+          sed "s|yourrepo/auth-python:0.1.0|$AWS_ACCOUNT_ID.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_PREFIX }}/auth-python:$VERSION|g" "$file" | \
+          sed "s|yourrepo/chat-node:0.1.0|$AWS_ACCOUNT_ID.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_PREFIX }}/chat-node:$VERSION|g" | \
+          sed "s|yourrepo/ranking-java:0.1.0|$AWS_ACCOUNT_ID.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_PREFIX }}/ranking-java:$VERSION|g" | \
+          sed "s|yourrepo/frontend-react:0.1.0|$AWS_ACCOUNT_ID.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_PREFIX }}/frontend-react:$VERSION|g" > "./infra/k8s-updated/$filename"
+        done
+
+    - name: Create namespace
+      run: |
+        kubectl create namespace production --dry-run=client -o yaml | kubectl apply -f -
+
+    - name: Deploy infrastructure services
+      run: |
+        echo "Deploying infrastructure services..."
+        kubectl apply -f ./infra/k8s-updated/postgres.yaml -n production
+        kubectl apply -f ./infra/k8s-updated/redis.yaml -n production
+        kubectl apply -f ./infra/k8s-updated/rabbitmq.yaml -n production
+
+    - name: Wait for infrastructure services
+      run: |
+        echo "Waiting for infrastructure services to be ready..."
+        kubectl wait --for=condition=ready pod -l app=postgres --timeout=300s -n production
+        kubectl wait --for=condition=ready pod -l app=redis --timeout=300s -n production
+        kubectl wait --for=condition=ready pod -l app=rabbitmq --timeout=300s -n production
+
+    - name: Deploy application services
+      run: |
+        echo "Deploying application services..."
+        kubectl apply -f ./infra/k8s-updated/auth-python.yaml -n production
+        kubectl apply -f ./infra/k8s-updated/ranking-java.yaml -n production
+        kubectl apply -f ./infra/k8s-updated/chat-node.yaml -n production
+
+    - name: Wait for application services
+      run: |
+        echo "Waiting for application services to be ready..."
+        kubectl wait --for=condition=ready pod -l app=auth-python --timeout=300s -n production
+        kubectl wait --for=condition=ready pod -l app=ranking-java --timeout=300s -n production
+        kubectl wait --for=condition=ready pod -l app=chat-node --timeout=300s -n production
+
+    - name: Deploy frontend
+      run: |
+        echo "Deploying frontend..."
+        kubectl apply -f ./infra/k8s-updated/frontend.yaml -n production
+        kubectl wait --for=condition=ready pod -l app=frontend --timeout=300s -n production
+
+    - name: Deploy ingress
+      run: |
+        echo "Deploying ingress..."
+        kubectl apply -f ./infra/k8s-updated/ingress.yaml -n production
+
+    - name: Check deployment status
+      run: |
+        echo "=== Deployment Status ==="
+        kubectl get pods -n production
+        echo ""
+        kubectl get services -n production
+        echo ""
+        kubectl get ingress -n production
+
+    - name: Notify deployment success
+      if: success()
+      run: |
+        echo "🎉 Production deployment completed successfully!"
+        echo "Version: ${{ needs.build.outputs.version }}"

@@ -1,0 +1,92 @@
+name: Cleanup Resources
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to cleanup'
+        required: true
+        type: choice
+        options:
+        - staging
+        - production
+        - both
+      confirm_cleanup:
+        description: 'Type "CONFIRM" to proceed with cleanup'
+        required: true
+        type: string
+
+env:
+  AWS_REGION: us-east-1
+  EKS_CLUSTER_NAME: datadog-runner
+
+jobs:
+  cleanup:
+    name: Cleanup Resources
+    runs-on: ubuntu-latest
+    if: github.event.inputs.confirm_cleanup == 'CONFIRM'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Install kubectl
+      run: |
+        curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+        chmod +x kubectl
+        sudo mv kubectl /usr/local/bin/
+
+    - name: Cleanup Staging Environment
+      if: github.event.inputs.environment == 'staging' || github.event.inputs.environment == 'both'
+      run: |
+        echo "🧹 Cleaning up staging environment..."
+        
+        # Update kubeconfig
+        aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.EKS_CLUSTER_NAME }}
+        
+        # Delete all resources in staging namespace
+        kubectl delete all --all -n staging || true
+        kubectl delete pvc --all -n staging || true
+        kubectl delete configmap --all -n staging || true
+        kubectl delete secret --all -n staging || true
+        kubectl delete ingress --all -n staging || true
+        
+        # Delete namespace
+        kubectl delete namespace staging || true
+        
+        echo "✅ Staging environment cleanup completed"
+
+    - name: Cleanup Production Environment
+      if: github.event.inputs.environment == 'production' || github.event.inputs.environment == 'both'
+      run: |
+        echo "🧹 Cleaning up production environment..."
+        
+        # Update kubeconfig
+        aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.EKS_CLUSTER_NAME }}
+        
+        # Delete all resources in production namespace
+        kubectl delete all --all -n production || true
+        kubectl delete pvc --all -n production || true
+        kubectl delete configmap --all -n production || true
+        kubectl delete secret --all -n production || true
+        kubectl delete ingress --all -n production || true
+        
+        # Delete namespace
+        kubectl delete namespace production || true
+        
+        echo "✅ Production environment cleanup completed"
+
+    - name: Cleanup Summary
+      run: |
+        echo "🎉 Cleanup completed successfully!"
+        echo "Environment(s) cleaned: ${{ github.event.inputs.environment }}"
+        echo ""
+        echo "⚠️  Note: EKS clusters and ECR repositories are NOT deleted."
+        echo "To delete EKS clusters, use the cleanup-eks.sh script locally."
